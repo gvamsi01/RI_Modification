@@ -1,0 +1,493 @@
+# Cloud Cost Workflow - RI Modification Tool Documentation
+
+The RI Modification tool suggests shifting of Unused RI **(considers both regional & non-regional)** within the regions to meet on-demand usage of AWS Instances. 
+
+The data from the following tables have been used for calculations
+
+      usage_derived.aws_cost_enriched_raw_actuals
+      usage_derived.aws_ri_list
+
+The following procedure has been adopted in calculations to suggest shift of unused RI. 
+
+1. Calculation & extraction of high proportional unused RI 
+   * Extraction of consumed reserved Instances from fast access cluster
+   * Extraction of active reserved Instances 
+   * Calculation of unused reserved instances 
+   * Aggregation of unused reserved instances 
+     * per day
+     * per month (user specified date or month) 
+   * Extraction of high proportional unused reserved instances
+ 
+2. Calculation of on-demand instances 
+   * Extraction of on-demand instances 
+   * Aggregation of on-demand instances
+     * per day
+     * per month
+
+3. Modification Suggestions
+   * Mapping of on-demand instance with potential unused RI's
+   * Shifting of available unused RI to on-demand instances
+ 
+4. Extraction of best combinations from suggested combinations
+
+5. Instances to be shifted per reserved instance (per id provided by AWS)
+
+### **Calculation & Extraction of potential unused RI**
+
+The unused RI are said to be highly potential if their non-usage is more than **80% (can be suggested by the user)**
+of the prescribed time for given combinations of availability zone, region, operating system and instance type
+
+**Note:** Records of regional RI are only reflected in active RI list though a regional RI is being used in one specific region's availabilty zone
+
+#### a. Extraction of consumed reserved instances
+
+The reserved instances consumption on hourly basis is fetched from **"usage_derived.aws_cost_enriched_raw_actuals"** table
+of fast-access-cluster using SQL written in python and is stored on-to a pandas dataframe. Code for extraction is given below
+
+``` python
+consumption_data = hivecontext.sql(""" select productname, 
+      year(usagestartdate) as yr, 
+      month(usagestartdate) as mon, 
+      day(usagestartdate) as dy, 
+      hour(usagestartdate) as hr,
+      region, availabilityzone, 
+      lower(os) as os, case 
+      when instancetype is NULL then 'm1.small' 
+      else instancetype end as instancetype, 
+      sum(usagequantity) as consumption,
+      sum(unblendedcost) as dollar 
+      from usage_derived.aws_cost_enriched_raw_actuals 
+      where 
+      lower(productname) = 'amazon elastic compute cloud' and
+      (unix_timestamp(usageenddate) - unix_timestamp(usagestartdate)) <= 3600 and 
+      to_date(usagestartdate) <= FROM_UNIXTIME(UNIX_TIMESTAMP('20170116' ,'yyyyMMdd'),'yyyy-MM-dd') and
+      to_date(usagestartdate) > date_sub(FROM_UNIXTIME(UNIX_TIMESTAMP('20170116' ,'yyyyMMdd'),'yyyy-MM-dd') , 14) and
+      purchaseoption = 'reservedinstance' 
+      group by productname, 
+      year(usagestartdate),
+      month(usagestartdate), 
+      day(usagestartdate), 
+      hour(usagestartdate), 
+      region, availabilityzone, 
+      os,instancetype 
+      order by yr, mon, dy, hr, 
+      region, availabilityzone, os, instancetype asc """)
+```
+
+#### b. Extraction of active resrved instances 
+
+The active reserved instances are fetched from **"usage_derived.aws_ri_list"** table of fast-access-cluster. Following snippet is the  code for extraction of active reserved instances
+
+```python
+#################### extractinhg active records to pandas data frame ################################
+active_full_data = hivecontext.sql(""" select reserved_instance_id, offering_type, 
+       region, availability_zone, 
+       case 
+       when lower(product_description) like '%windows%' then 'windows' 
+       when lower(product_description) like '%linux%' then 'linux' 
+       else product_description end as os, 
+       trim(instance_type) as instancetype, 
+       sum(instance_count) as active 
+       from usage.aws_ri_list 
+       where state = 'active' 
+       group by reserved_instance_id, offering_type, region, availability_zone, product_description, instance_type 
+       order by reserved_instance_id, offering_type, region, availability_zone, product_description, instance_type asc """)
+
+active_data = active_full_data.select("region","availability_zone","os","instancetype","active")
+active_data = active_data.groupby(["region","availability_zone","os","instancetype"]).agg( sum('active').alias('active'))
+```
+
+#### c. Calculation of unused reserved instances 
+
+The extracted "consumption" & "active" data are mapped on to each other on **"region", "os" & "instancetype"** 
+
+Unused RI is calculated as **Active - Consumption** only if consumed instance's availability zone is matching with active instance's availabilty zone of a particular region,
+however incase of **active regional RI** the above mentioned condition is not considered
+
+Code snippet for unsued RI calculation
+
+``` python 
+############### Data Transformation logic begins #####################
+##### merging active & reserved instances to calculate unused RI #####
+combined_data = consumption_data.join(active_data, ["region","os","instancetype"], "left" )
+
+##### extracting regional instances & instances with combinations of os, availabilityzone & region ######
+combined_data = combined_data.filter( (combined_data.availabilityzone == combined_data.availability_zone ) | 
+                           (combined_data.region == combined_data.availability_zone ) )
+
+###### dropping duplicated records if exists combined_data #####
+combined_data = combined_data.drop_duplicates()
+
+####### counting number of times the regional RI record is repeating ###############
+count_records = combined_data.groupBy(combined_data.productname,combined_data.yr,combined_data.mon,combined_data.dy,combined_data.hr,combined_data.region,
+                           combined_data.availability_zone,combined_data.os,combined_data.instancetype).count()
+
+
+####### Aggregating combined data #########                           
+merge_data = combined_data.groupby(["productname","yr","mon","dy","hr","region","availability_zone","os","instancetype"]).\
+             agg( sum('dollar').alias('dollar'),  sum('consumption').alias('consumption'),  sum('active').alias('active') )
+
+             
+###### calculating the RI difference (unused RI) ########
+merge_data = merge_data.join(count_records,["productname","yr","mon","dy","hr","region","availability_zone","os","instancetype"],"left")
+merge_data = merge_data.withColumn('active',  col("active")/ col("count"))
+merge_data = merge_data.withColumn("unused_RI",  col("active") -  col("consumption"))
+merge_data = merge_data.withColumn("unused_RI",  when(merge_data["unused_RI"] < 0, 0).otherwise(merge_data["unused_RI"]))
+merge_data = merge_data.drop('count')
+###### Unused RI calculation completed ######
+```
+
+#### d. Aggregation of unused reserved instances
+
+The above calculated unused reserved instances on hourly basis are aggregated on daily and monthly basis (prescribed by user)
+and are stored into two separate pandas dataframes. 
+
+##### Feature Engineering
+
+A new variable "unused RI hrs" has been introduced to monitor number of hours where **"consumed RI < active RI".**
+
+Another variable "usage_proportion" has been introduced to calculate proportion of unused RI hours on daily and monthly level 
+
+               "usage_proportion_day"  =  unused_RI_hrs / total no of hours recorded per day in AWS
+               "usage_proportion_month"  =  unused_RI_hrs / total no of hours recorded per month in AWS
+
+The above two mentioned variables are integrated with daily & monthly aggregated unused reserved instance tables. 
+
+``` python
+################### Data aggergation per day & per month ##########
+####### Aggregating unused reserved instances per day #########
+merge_data_day = merge_data.groupby('productname','yr','mon','dy','region','availability_zone','os','instancetype').\
+    agg( count('hr').alias('hrcount'),
+     sum('dollar').alias('dollarsum'),
+     sum('consumption').alias('consumptionsum'),
+     sum('active').alias('activesum'), 
+     sum('unused_RI').alias('unused_RItotal'),
+     sum( when( col("unused_RI")>0,1).otherwise(0)).alias('unused_RItotal_hrs')).\
+    orderBy(["region","availability_zone","os","instancetype","yr","mon","dy"])
+    
+merge_data_day = merge_data_day.withColumn('Non_usage_hr_prop_day', col("unused_RItotal_hrs")*100/ col("hrcount"))
+
+####### Aggreating unused reserved instances per month #######
+merge_data_month = merge_data.groupby('productname','region','availability_zone','os','instancetype').\
+    agg( count('hr').alias('hrcount'),
+     sum('dollar').alias('dollarsum'),
+     sum('consumption').alias('consumptionsum'),
+     sum('active').alias('activesum'), 
+     sum('unused_RI').alias('unused_RItotal'),
+     sum( when( col("unused_RI")>0,1).otherwise(0)).alias('unused_RItotal_hrs')).\
+    orderBy(["region","availability_zone","os","instancetype"])
+    
+merge_data_month = merge_data_month.withColumn('Non_usage_hr_prop_month', col("unused_RItotal_hrs")*100/ col("hrcount"))
+################# Data aggregation completed ############# 
+``` 
+
+#### e. Extraction of potential unused reserved instances 
+
+The unused reserved instances whose non-usage proportion is more or equal to 80% through out the month (till user specified date) are considered as 
+potential reserved instances which can be used to accommodate on-demand. The result are stored in a separate dataframe
+
+```python
+######## Potential unused RI #############
+### These unused RI's in merge_data_month_sort can be used for on-demand manipulation
+### The data is arranged in the ascending order of highest non_usage_proportion throughout the month
+merge_data_month_sort = merge_data_month.filter('Non_usage_hr_prop_month >= 80').orderBy(["dollarsum","Non_usage_hr_prop_month"],
+                        ascending = [0,0]) ### number 80 can be changed accordingly
+#################################### Completion of of reserved instances & Active records extraction ##########################
+```
+
+### **Calculation of on-demand instances**
+
+#### a. Extraction of on-demand instances 
+
+The on-demand instances on hourly basis are fetched from **"usage_derived.aws_cost_enriched_raw_actuals"** table of fast-access-cluster using SQL written in python and is stored on-to a pandas dataframe. 
+
+Code for ondemand instances extraction is given below
+
+```python 
+ondemand_data = hivecontext.sql(""" select productname, 
+      year(usagestartdate) as ondemand_yr, 
+      month(usagestartdate) as ondmenad_mon, 
+      day(usagestartdate) as ondemand_days, 
+      hour(usagestartdate) as ondemand_hrs,
+      region, availabilityzone, 
+      lower(os) as os, case 
+      when instancetype is NULL then 'm1.small' 
+      else instancetype end as ondemand_instancetype, 
+      sum(usagequantity) as quantity_used, 
+      sum(unblendedcost) as dollar_spent 
+      from usage_derived.aws_cost_enriched_raw_actuals 
+      where 
+      lower(productname) = 'amazon elastic compute cloud' 
+      and (unix_timestamp(usageenddate) - unix_timestamp(usagestartdate)) <= 3600 
+      and to_date(usagestartdate) <= FROM_UNIXTIME(UNIX_TIMESTAMP('20170116' ,'yyyyMMdd'),'yyyy-MM-dd') 
+      and to_date(usagestartdate) > date_sub(FROM_UNIXTIME(UNIX_TIMESTAMP('20170116' ,'yyyyMMdd'),'yyyy-MM-dd') , 14)
+      and purchaseoption = 'on-demand' 
+      and instr(lower(itemdescription),'instance') > 0 and 
+      not instr(itemdescription,'Mbps')>0 
+      and measure = 'Hour' 
+      and os != 'N/A' 
+      group by productname, 
+      year(usagestartdate),
+      month(usagestartdate), 
+      day(usagestartdate), 
+      hour(usagestartdate), 
+      region, availabilityzone, 
+      os,instancetype 
+      order by ondemand_yr, ondmenad_mon, ondemand_days, 
+      ondemand_hrs,region, availabilityzone, os, instancetype asc """)
+```
+
+#### b. Aggregation of on-demand instances 
+
+The extraced on-demand instances(hourly basis) have been aggregated on daily and monthly basis (prescribed by user) individually for the combinations of region, availability zone and os. 
+The aggregated data is stored into two separate pandas dataframes. 
+
+##### Feature Engineering
+
+Another variable "Demand proportion" has been introduced to monitor demand of particular instance on daily & monthly level
+
+               "Demand proportion_day"  =  total no of hours recorded per day in AWS / 24 
+               "Demand_proportion_month"  = total no of hours recorded per month in AWS / days in particular month
+
+The above two mentioned variables are integrated with daily & monthly aggregated on-demand instance tables. 
+
+``` python
+####### Aggregating on-demand data per day #######
+ondemand_data_day = ondemand_data.groupby("productname","ondemand_yr", "ondmenad_mon", "ondemand_days","region","availabilityzone","os","ondemand_instancetype").\
+    agg( count('ondemand_hrs').alias('ondemand_hrs'),
+             sum('dollar_spent').alias('dollar_spent'),
+             sum('quantity_used').alias('quantity_used')).\
+    orderBy(["region","availabilityzone","os","ondemand_instancetype","ondemand_yr", "ondmenad_mon", "ondemand_days"])
+    
+ondemand_data_day = ondemand_data_day.withColumn("Demand_hr_day_prop", col("ondemand_hrs")*100/24)
+
+####### Aggregating on-demand data per month ######
+ondemand_data_month = ondemand_data.groupby("productname","region","availabilityzone","os","ondemand_instancetype").\
+    agg( count('ondemand_hrs').alias('ondemand_hrs'),
+         sum('dollar_spent').alias('dollar_spent'),
+         sum('quantity_used').alias('quantity_used'),
+         countDistinct('ondemand_days').alias('ondemand_days')).\
+    orderBy(["productname","region","availabilityzone","os","ondemand_instancetype"])
+    
+ondemand_data_month = ondemand_data_month.withColumn("Demand_hr_month_prop", (col("ondemand_hrs")*100)/ (col("ondemand_days")*24))
+                                                     
+############ sorting wrt to dollar spent & demand proportion ############
+ondemand_data_month = ondemand_data_month.orderBy(["dollar_spent","Demand_hr_month_prop"],ascending = [0,0])
+``` 
+
+### **RI Modifications**
+
+#### a. Mapping of on-demand instances with available unused reserved instances  
+
+Every on-demand instance is mapped to available potential unused RI in their respective regions on the basis of operating system (os) and instance family type 
+
+``` python
+
+######### joining on-demand data with possible RI availability data based on product name, region, os ###########
+modified_RI= merge_data_month_sort.join(ondemand_data_month,["productname","region","os"],"left")
+
+######### filtering records whose ondemand instance matching with unused RI instance family
+modified_RI = modified_RI.withColumn("isin", when( col("ondemand_instancetype").substr(1,2) ==  col("instancetype").substr(1,2),1).
+              otherwise(0)).filter("isin=1").drop("isin")
+
+```
+
+Snippet of mapped on-demand instance with unused RI is given below
+
+| Unused RI Region |Unused RI Availability_zone|Operating System|Available instance type|On-demand availability zone|On-demand instance type|
+|------------------| --------------------------|----------------|----------------------|---------------------------|----------------|
+|      us-east -1  |          us-east-1a       |      windows   |   m3.xlarge          |     us-east-1a            |    m3.2xlarge  |
+|      us-east -1  |          us-east-1b       |      windows   |   m3.xlarge          |     us-east-1a            |    m3.2xlarge  | 
+|      us-east -1  |          us-east-1d       |      windows   |   m3.large           |     us-east-1a            |    m3.2xlarge  |
+|      us-east -1  |          us-east-1e       |      windows   |   m3.xlarge          |     us-east-1a            |    m3.2xlarge  |
+|      us-east -1  |          us-east-1a       |      linux     |   m3.xlarge          |     us-east-1a            |    m3.2xlarge  |
+|      us-east -1  |          us-east-1e       |      linux     |   m3. large          |     us-east-1a            |    m3.2xlarge  |
+
+#### b. Shifting of available (unused) RI to on-demand instances
+
+The shifting of available unused RI to on-demand availability zone within a region can be achieved by upgrading or downgrading or using the same instance type of unused (available) RI's instance type. 
+
+Inorder to achieve this every instance is compared with number of CPU's required for processing and are upgraded or downgraded depending on on-demand usage 
+
+The CPU's required for each instance type is taken from [AWS instance types] (https://aws.amazon.com/ec2/instance-types/)
+
+Snippet below shows available (unused RI), on-demand instance requirement for a particular combination of instance family, operating system and availability zone in "us-east-1" region
+
+|Unused RI Availability_zone|Operating System|Available instance type|Available (Unused RI)|On-demand availability zone|On-demand instance type|On-demand| Instances to be shifted| On-demand instances reduced|
+|------------------| ----------|----------------|----------------|--------|--------------|----------|--------|---------|
+|     us-east -1a  |         windows     |    m3.xlarge | 10  |us-east-1a         |    m3.2xlarge |    44   | 10 |5|
+
+The number of instances to be shifted from unused RI's availability zone to on-demand availability zone is done by using the following logic
+
+                  If “No of On-demand CPU’s” > “No of unused CPU’s”
+                        Unused (available) instances
+                  Else:
+                        (No of On-demand CPU’s / (no.of CPU’s required to make an instancetype in availabiltyzone)) 
+
+The reduction in on-demand instances has been calculated using the below logic
+
+                  If “No of On-demand CPU’s” > “No of unused CPU’s”
+                        (Unused (available) instances *  (no.of CPU’s required to make an instancetype in availabiltyzone))/
+                         (no.of CPU’s required to make an on-demand instance)
+                  Else:
+                        On-demand instances
+
+
+### **Extraction of best combinations**
+
+The above described logic generated a huge list of possible modification (shifting of unused RI to meet on-demand) for every unused instance available in the particular region. 
+
+Best combinations are extracted based on below thumb rules 
+
+      a. “No of instances to be shifted” <= “Available unused Instances” for every unused instance 
+      b. "Avg On-demand instances" <= "On-demand instances Increased" for every ondemand instance 
+
+The below sinppet shows the code used for extracting best combinations
+
+```python
+######################### Extracting the best combinations out of the suggested ############################
+modified_RI_pandas_copy = modified_RI_pandas.copy()
+z= len(modified_RI_pandas_copy)
+DATA = pd.DataFrame()
+sumins = 0
+
+
+for i in range(1, z-1):
+    if ((sumins <= modified_RI_pandas_copy.loc[i - 1, "Avg_unused_instances"]) & (modified_RI_pandas_copy.loc[i - 1, "check"] == 0) &
+            (modified_RI_pandas_copy.loc[i, "availability_zone"] == modified_RI_pandas_copy.loc[i - 1, "availability_zone"]) &
+            (modified_RI_pandas_copy.loc[i, "os"] == modified_RI_pandas_copy.loc[i - 1, "os"]) &
+            (modified_RI_pandas_copy.loc[i, "instancetype"] == modified_RI_pandas_copy.loc[i - 1, "instancetype"]) &
+            (modified_RI_pandas_copy.loc[i, "Instances_tobe_shifted"] >= 1)):
+
+        if ((sumins + modified_RI_pandas_copy.loc[i - 1, "Instances_tobe_shifted"]) < modified_RI_pandas_copy.loc[i - 1, "Avg_unused_instances"]):
+            DATA = DATA.append(modified_RI_pandas_copy.iloc[i - 1,])
+            sumins = sumins + modified_RI_pandas_copy.loc[i - 1, "Instances_tobe_shifted"]
+
+            if (modified_RI_pandas_copy.loc[i - 1, "Ondemand_instances_reduced"] == modified_RI_pandas_copy.loc[i - 1, "Avg_ondemand_instances"]):
+                modified_RI_pandas_copy.loc[((modified_RI_pandas_copy["os"] == modified_RI_pandas_copy.loc[i - 1, "os"]) &
+                               (modified_RI_pandas_copy["availabilityzone"] == modified_RI_pandas_copy.loc[i - 1, "availabilityzone"]) &
+                               (modified_RI_pandas_copy["ondemand_instancetype"] == modified_RI_pandas_copy.loc[i - 1, "ondemand_instancetype"])), "check"] = 1
+            else:
+                modified_RI_pandas_copy.loc[((modified_RI_pandas_copy["os"] == modified_RI_pandas_copy.loc[i - 1, "os"]) &
+                               (modified_RI_pandas_copy["availabilityzone"] == modified_RI_pandas_copy.loc[i - 1, "availabilityzone"]) &
+                               (modified_RI_pandas_copy["ondemand_instancetype"] == modified_RI_pandas_copy.loc[i - 1, "ondemand_instancetype"])),"New_demand"] = \
+                    modified_RI_pandas_copy["Avg_ondemand_instances"] - modified_RI_pandas_copy.loc[i - 1, "Ondemand_instances_reduced"]
+
+                modified_RI_pandas_copy["Avg_ondemand_CPU_needed"] = modified_RI_pandas_copy["Avg_ondemand_instances"] * modified_RI_pandas_copy["ondemand_instance_CPU"]
+
+                modified_RI_pandas_copy["Instances_tobe_shifted"] = np.where(modified_RI_pandas_copy["Avg_ondemand_CPU_needed"] > modified_RI_pandas_copy["Avg_unused_CPU_available"],
+                                                                  modified_RI_pandas_copy["Avg_unused_CPU_available"] / modified_RI_pandas_copy["unused_instance_CPU"],
+                                                                  modified_RI_pandas_copy["Avg_ondemand_CPU_needed"] / modified_RI_pandas_copy["unused_instance_CPU"])
+
+                modified_RI_pandas_copy["Instances_tobe_shifted"] = (modified_RI_pandas_copy["Instances_tobe_shifted"]).apply(np.round)
+
+                modified_RI_pandas_copy["Ondemand_instances_reduced"] = np.where(modified_RI_pandas_copy["Avg_ondemand_CPU_needed"] > modified_RI_pandas_copy["Avg_unused_CPU_available"],
+                                                                    modified_RI_pandas_copy["Avg_unused_CPU_available"] / modified_RI_pandas_copy["ondemand_instance_CPU"],
+                                                                    modified_RI_pandas_copy["Avg_ondemand_CPU_needed"] / modified_RI_pandas_copy["ondemand_instance_CPU"])
+
+                modified_RI_pandas_copy["Ondemand_instances_reduced"] = (modified_RI_pandas_copy["Ondemand_instances_reduced"]).apply(np.round)
+
+                modified_RI_pandas_copy["Ondemand_instances_increased"] = modified_RI_pandas_copy["Instances_tobe_shifted"] * modified_RI_pandas_copy["unused_instance_CPU"] / modified_RI_pandas_copy["ondemand_instance_CPU"]
+                
+                modified_RI_pandas_copy["Ondemand_instances_increased"] = (modified_RI_pandas_copy["Ondemand_instances_increased"]).apply(np.round)
+                
+
+                continue
+        else:
+            continue
+    elif (modified_RI_pandas_copy.loc[i - 1, "check"] == 1):
+        continue
+
+    elif (i == 1 | i == z - 1):
+        DATA = DATA.append(modified_RI_pandas_copy.iloc[i,])
+
+    else:
+        sumins = 0
+        continue
+
+######### Changing on-demand availability zone name tag #############
+DATA = DATA.reset_index()
+for i in range(0,len(DATA)) :
+    if ( DATA.loc[i,"region"] == DATA.loc[i,"availability_zone"]):
+        DATA.loc[i,"availabilityzone"] = DATA.loc[i,"availability_zone"]
+    else:
+        continue
+
+################################### Completion of best combination extraction ############################
+```
+The above code dynamically updates **Instances to be shifted** & **Increase in on-demand** instances due to shifting of unused RI in particular unused RI's region and an instance 
+whose on-demand is met by regional RI, it is considered as regional RI in the calculations.
+
+The sample output of the data is shown below
+
+|product_name|unused_ri_available_region| unused_ri_availability_zone| unused_ri_instance type| average_unused_instances| on-demand_availabilityzone|on-demand_instance_type|avg_ondemand_instances|instances_to_be_shifted|on-demand_instances_increased|
+|------|------|---------|---------|-----------------|-------------|-------------|--------|-----|---|
+|Amazon Elastic compute cloud|us-east-1|us-east-1a|m3.xlarge|10|us-east-1b|m3.large|4|2|4|
+
+### **Instances to be shifted per reserved instance (per id provided by AWS)**
+
+The above given output shows number of instances to be shifted from unused_ri_availabilityzone to the ondemand availability zone, however 
+we need to provide the number of instances to be shifted per individual reserved instance in particular region
+
+The reserved instance id which have lesser number of instances are considered for shifting to the ondemand availability zone based on max savings incurred.
+The given code below will serve our purpose 
+
+```python 
+##### adding dummy columns to active_full_data for extracting individual instances shifting ###################### 
+active_full_data = active_full_data.withColumn("check", func.lit(0))
+active_full_data = active_full_data.withColumn("active_instances_tobe_shifted", func.lit(0))
+active_full_data = active_full_data.withColumn("active_check", func.col("active"))
+ 
+ 
+########## Converting active_full_data to pandas 
+active_full_data_pandas = active_full_data.toPandas()
+
+reserve_instance_id_shift = pd.merge(data_dump,active_full_data_pandas, left_on = ["region","unused_ri_availabilityzone","os","unused_ri_instancetype"],
+                                     right_on = ["region", "availability_zone", "os", "instancetype"],how = "left")
+
+x= reserve_instance_id_shift.copy()
+sumins = 0
+y = len(x)
+for i in range(1,y):
+
+    if((x.loc[i-1,"check"] == 0) & (x.loc[i-1,"instances_tobe_shifted"] <= x.loc[i-1,"active_check"]) &
+       (x.loc[i,"reserved_instance_id"] == x.loc[i-1,"reserved_instance_id"]) &
+       (x.loc[i,"region"] == x.loc[i-1,"region"]) & 
+       (x.loc[i,"availability_zone"] == x.loc[i-1,"availability_zone"]) &
+       (x.loc[i-1,"active_check"] >0)):
+        x.loc[i-1,"active_instances_tobe_shifted"] = x.loc[i-1,"instances_tobe_shifted"]
+        sumins = sumins + x.loc[i-1,"instances_tobe_shifted"]
+        x.loc[i,"active_check"] = x.loc[i,"active_check"] - sumins 
+        
+        x.loc[((x["os"] == x.loc[i-1, "os"]) &
+              (x["ondemand_availabilityzone"] == x.loc[i-1 , "ondemand_availabilityzone"]) &
+              (x["ondemand_instancetype"] == x.loc[i-1 , "ondemand_instancetype"])), "check"] = 1
+    
+    
+    
+    elif((x.loc[i-1,"check"] == 0) & (x.loc[i-1,"instances_tobe_shifted"] <= x.loc[i-1,"active_check"]) &
+         (x.loc[i-1,"active_check"] >0)):
+        
+        x.loc[i-1,"active_instances_tobe_shifted"] = x.loc[i-1,"instances_tobe_shifted"]
+        sumins = 0
+        x.loc[((x["os"] == x.loc[i-1, "os"]) &
+              (x["ondemand_availabilityzone"] == x.loc[i-1 , "ondemand_availabilityzone"]) &
+              (x["ondemand_instancetype"] == x.loc[i-1 , "ondemand_instancetype"])), "check"] = 1
+    
+    else:
+        sumins=0
+        continue
+
+
+x = x.loc[x["active_instances_tobe_shifted"] > 0]
+
+data_dump_instances =  x.loc[:,["productname","reserved_instance_id", "account_id" ,"offering_type", "instancetype", "region", 
+                                "availability_zone" ,"os" ,"active", "ondemand_availabilityzone","ondemand_instancetype","active_instances_tobe_shifted","savings" ]]
+```
+
+The sample output of RI Modification per reserved instance id is given below
+
+|productname|reserved_instance_id|account_id|offering_type|instancetype|region|availability_zone|os|active|ondemand_availabilityzone|ondemand_instancetype|active_instances_tobe_shifted|savings|
+|------|------|---------|---------|-----------------|-------------|-------------|--------|-----|---|----|----|-----|
+|Amazon Elastic Compute Cloud|a74a5fc7-15bc-4673-9dc3-e39dccb86eb4|868653353050|Partial Upfront|t2.small|us-west-1|us-west-1|linux|28.0|us-west-1|t2.large|2.0|81.9839|
+|Amazon Elastic Compute Cloud|c464516b-3fa0-43e0-95d3-10b27c91d5ef|868653353050|Partial Upfront|t2.nano|us-west-2|us-west-2|linux|5.0|us-west-2|t2.small|2.0|15.45|

@@ -1,0 +1,41 @@
+<!--
+##########################
+
+ This coordinator schedules adp-workflow-template workflow daily
+
+ Command oozie job -oozie http://<oozie-server-ip>:11000/oozie -config coordinator.properties -D CLUSTER=<cluster-environment> -D COORD_STARTTIME=<start-time> -D COORD_ENDTIME=<end time>  -D SERVER=<server-ip>  -D PROJECT_NAME=<project-name>  -D CAT=<category> -run 
+ 
+Usage example
+               
+         oozie job -oozie http://10.37.80.40:11000/oozie -config coordinator.properties -D CLUSTER=stg -D COORD_STARTTIME=2015-12-17T08:00Z -D COORD_ENDTIME=2015-12-17T09:00Z  -D SERVER=10.37.83.19  -D PROJECT_NAME=RI-Modifications  -D CAT=ase -run
+ 
+Description:
+This workflow is scheduled to run twice a month, end of 1st workday and 3rd workday.
+The workflow will update cost for last month. Both daily and monthly aggregation are partitioned by month.
+
+##########################
+ -->
+<coordinator-app name="${PROJECT_NAME}" frequency="${coord:days(14)}"  start="${COORD_STARTTIME}" end="${COORD_ENDTIME}" timezone="UTC" xmlns="uri:oozie:coordinator:0.2">
+
+  <controls>
+    <timeout>90</timeout> 
+  </controls>    
+
+  <action>
+     <workflow>
+       <app-path>${WORKFLOW_DIR}</app-path>                                                           <!-- location of the workflow -->
+       <configuration>         
+         <property>
+           <name>DT</name>    <!-- property name to be passed to the workflow -->
+           <value>${coord:formatTime(coord:dateOffset(coord:nominalTime(), 0, 'DAY'), 'yyyyMMdd')}</value> <!-- property value of DT , DT would populates with one day behind of coordinator date -->
+         </property> 
+		 
+		 <property>
+           <name>MON</name>    <!-- property name to be passed to the workflow -->
+           <value>${coord:formatTime(coord:dateOffset(coord:nominalTime(), 0, 'DAY'), 'yyyyMM')}</value> <!-- property value of DT , DT would populates with one day behind of coordinator date -->
+         </property> 
+       </configuration>
+     </workflow>
+   </action>
+</coordinator-app>
+

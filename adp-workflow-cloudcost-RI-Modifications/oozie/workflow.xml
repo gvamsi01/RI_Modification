@@ -1,0 +1,104 @@
+<!--
+    This workflow would help to run sample pi-spark jobs, which triggers a spark submit on given (qubole)cluster.
+    You may want to description on 
+
+Usage:
+    oozie job -oozie <oozie-ip> -config <job.properties> -D SERVER=<SERVER> -D CLUSTER=dev -D PROJECT_NAME=<project-name> -D DT=<DT> -run
+Example:
+    
+    oozie job -oozie http://10.37.80.40:11000/oozie -config job.properties -D CLUSTER=stg -D DT=20151217  -D SERVER=10.37.83.19  -D PROJECT_NAME=adp-workflow-template-project1  -D CAT=ase -run
+    
+     -->
+<workflow-app name="${PROJECT_NAME}_${MON}_${DT}" xmlns="uri:oozie:workflow:0.5">
+    <global>
+        <job-tracker>${JOBTRACKER}</job-tracker>                                       <!-- hadoop jobtracker eg. 10.37.83.19:9022  -->
+        <name-node>${NAMENODE}</name-node>                                             <!-- namenode eg. hdfs://10.37.83.19:9000 --> 
+        <configuration>
+            <property>
+                <name>mapred.job.queue.name</name>
+                <value>${QUEUE_NAME}</value>                                           <!-- oozie job queueing method eg. default -->
+            </property>
+         </configuration>
+    </global>
+
+    <start to="Modifications" />                                                       <!--  This directs to the start/opening action --> 
+    
+     <action name="Modifications" retry-max="1" retry-interval="1">
+        <shell xmlns="uri:oozie:shell-action:0.2">
+            <job-tracker>${JOBTRACKER}</job-tracker>
+            <name-node>${NAMENODE}</name-node>
+            <configuration>
+                <property>
+                    <name>mapred.job.queue.name</name>
+                    <value>${QUEUE_NAME}</value>
+                </property>
+            </configuration>
+            <exec>python</exec>
+            <argument>sparkClient.py</argument>
+            <argument>${PYTHON_SPARK_CONF}</argument>
+            <argument>${SRC_PYTHON_DIR}/Modifications.py</argument>
+            <argument>--configArguments</argument>
+            <argument>action_name=${wf:name()}</argument>
+            <argument>cmdline=''</argument>
+            <argument>--queryArguments</argument>
+            <argument>${DT}</argument>
+            <argument>${DATABASE_DERIVED}</argument>
+            <argument>${DATABASE}</argument>
+			<argument>${FREQUENCY}</argument>
+			<argument>${CUTOFF}</argument>
+            <file>${COMMON_PYTHON_SCRIPTS_DIR}/sparkClient.py#sparkClient.py</file>
+            <file>${COMMON_PYTHON_SCRIPTS_DIR}/common.py#common.py</file>
+            <file>${COMMON_PYTHON_SCRIPTS_DIR}/utils.py#utils.py</file>
+        </shell>
+        <ok to="success_mail" />
+        <error to="failure_mail" />
+    </action>
+	
+	
+	
+    <!-- ======================SUCCESS MAIL ====================== --> 
+    <action name="success_mail" retry-max="1" retry-interval="1">
+        <email xmlns="uri:oozie:email-action:0.1">
+            <to>${SUCCESS_EMAIL_DLIST}</to>                                            <!-- add 'To' email address -->
+            <subject>  ${CLUSTER} | SUCCESS |${wf:name()}</subject>             <!-- form the mail subject --> 
+            <body>
+                NAMENODE: ${NAMENODE}
+                USER: ${wf:user()}
+                ID: ${wf:id()}
+                PATH: ${wf:appPath()}
+                WORKFLOW NAME : ${wf:name()}
+                ACTION NAME : "success_mail"
+                Message: ${wf:name()} Finished for ${DT} 
+            </body>
+        </email>
+        <ok to="end" />                                                                <!-- upon successful completion, proceed to the 'end' action of workflow -->                                                            
+        <error to="fail" />
+    </action>
+    
+    <!-- ======================FAILURE MAIL ======================--> 
+    <action name="failure_mail" retry-max="1" retry-interval="1">
+        <email xmlns="uri:oozie:email-action:0.1">
+            <to>${FAIL_EMAIL_DLIST}</to>
+            <subject>  ${CLUSTER} | FAILURE | ${wf:name()}</subject>
+            <body>
+                NAMENODE: ${NAMENODE}
+                USER: ${wf:user()}
+                ID: ${wf:id()}
+                PATH: ${wf:appPath()}
+                WORKFLOW NAME : ${wf:name()}
+                ACTION NAME :  "failure_mail"
+                Error Message: ${wf:errorMessage(wf:lastErrorNode())} Failed for ${DT}
+            </body>
+        </email>
+
+        <ok to="fail"/>
+        <error to="fail"/>
+    </action>
+
+     
+    <kill name="fail">                                                                  <!-- in case of failure of sending mail - force oozie to show the action failed -->    
+        <message>Workflow failed, error message[${wf:errorMessage(wf:lastErrorNode())}]</message>
+    </kill>
+
+    <end name="end" />
+</workflow-app>
